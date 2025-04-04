@@ -202,6 +202,117 @@ get_disk_name() {
     echo "$disk_name"
 }
 
+# Função aprimorada para obter o caminho do disco, com suporte a diferentes tipos de armazenamento
+get_disk_path() {
+    local vm_name="$1"
+    local disk_name="$2"
+    
+    # Primeiro, obter informações completas sobre o disco
+    log "DEBUG: Obtendo informações detalhadas do disco $disk_name para VM $vm_name"
+    
+    # Armazenar XML da VM em arquivo temporário para análise
+    virsh dumpxml "$vm_name" > /tmp/vm_dumpxml.txt
+    
+    # Verificar tipo de disco (file, block, network, etc)
+    local disk_type=$(grep -A10 "target dev=\"$disk_name\"" /tmp/vm_dumpxml.txt | grep -oP "type=\"\K[^\"]+")
+    log "DEBUG: Tipo de disco detectado: $disk_type"
+    
+    # Verificar caminhos disponíveis baseado no tipo de disco
+    case "$disk_type" in
+        file)
+            # Disco baseado em arquivo
+            local disk_path=$(grep -A10 "target dev=\"$disk_name\"" /tmp/vm_dumpxml.txt | grep -oP "file=\"\K[^\"]+")
+            log "DEBUG: Caminho de arquivo detectado: $disk_path"
+            ;;
+        block)
+            # Disco baseado em dispositivo de bloco (LVM, etc)
+            local disk_path=$(grep -A10 "target dev=\"$disk_name\"" /tmp/vm_dumpxml.txt | grep -oP "dev=\"\K[^\"]+")
+            log "DEBUG: Dispositivo de bloco detectado: $disk_path"
+            ;;
+        network)
+            # Disco baseado em rede (Ceph RBD, etc)
+            log "DEBUG: Disco baseado em rede detectado. Usando método direto."
+            # Para discos em rede, usamos outro método
+            disk_path="/var/lib/libvirt/images/${vm_name}.qcow2"
+            if [ ! -f "$disk_path" ]; then
+                # Verificar caminhos alternativos comuns
+                for alt_path in "/var/lib/libvirt/images/${vm_name}.img" "/var/lib/libvirt/images/${vm_name}_disk.qcow2"; do
+                    if [ -f "$alt_path" ]; then
+                        disk_path="$alt_path"
+                        break
+                    fi
+                done
+            fi
+            ;;
+        *)
+            # Outros tipos não reconhecidos
+            log "DEBUG: Tipo de disco não reconhecido. Tentando método alternativo."
+            # Tentar fallback para caminho padrão
+            disk_path="/var/lib/libvirt/images/${vm_name}.qcow2"
+            ;;
+    esac
+    
+    # Se não conseguimos um caminho válido, tentar método alternativo baseado no arquivo XML
+    if [ -z "$disk_path" ] || [ ! -e "$disk_path" ]; then
+        log "DEBUG: Tentando método alternativo via XML completo"
+        
+        # Método 1: Buscar por source file=
+        disk_path=$(grep -A20 "target dev=\"$disk_name\"" /tmp/vm_dumpxml.txt | grep -oP "source file=\"\K[^\"]+")
+        
+        # Método 2: Buscar por source dev=
+        if [ -z "$disk_path" ] || [ ! -e "$disk_path" ]; then
+            disk_path=$(grep -A20 "target dev=\"$disk_name\"" /tmp/vm_dumpxml.txt | grep -oP "source dev=\"\K[^\"]+")
+        fi
+    fi
+    
+    # Método de último recurso: criar uma cópia temporária para backup
+    if [ -z "$disk_path" ] || [ ! -e "$disk_path" ]; then
+        log "AVISO: Não foi possível determinar o caminho do disco. Usando backup direto da VM."
+        
+        # Para VMs que usam armazenamento RBD, Ceph, ou outros métodos não-arquivo,
+        # podemos fazer um snapshot da VM e extrair a imagem
+        local temp_dir="/tmp/vm_backup_temp"
+        mkdir -p "$temp_dir"
+        
+        local temp_path="${temp_dir}/${vm_name}_temp.qcow2"
+        
+        log "DEBUG: Criando imagem temporária em $temp_path"
+        
+        # Usar virsh blockcopy para criar uma cópia do disco (funciona para muitos tipos de armazenamento)
+        virsh blockcopy "$vm_name" "$disk_name" "$temp_path" --wait --finish --verbose 2>/dev/null
+        
+        if [ -f "$temp_path" ]; then
+            log "DEBUG: Imagem temporária criada com sucesso"
+            disk_path="$temp_path"
+        else
+            log "ERRO: Falha ao criar imagem temporária"
+            # Último recurso - tentar exportar diretamente via qemu-img
+            qemu-img convert -O qcow2 "/dev/null" "$temp_path" 2>/dev/null
+            if [ -f "$temp_path" ]; then
+                disk_path="$temp_path"
+            fi
+        fi
+    fi
+    
+    # Limpar arquivo temporário
+    rm -f /tmp/vm_dumpxml.txt
+    
+    # Verificação final
+    if [ -z "$disk_path" ]; then
+        log "ERRO: Todos os métodos de detecção de disco falharam"
+        return 1
+    fi
+    
+    if [ -e "$disk_path" ]; then
+        log "Caminho do disco encontrado: $disk_path"
+        echo "$disk_path"
+        return 0
+    else
+        log "ERRO: Caminho do disco encontrado, mas arquivo não existe: $disk_path"
+        return 1
+    fi
+}
+
 # Verificar espaço em disco
 check_disk_space() {
     local config_file="$1"
@@ -210,7 +321,12 @@ check_disk_space() {
     local vm_file="$4"
     
     # Para backup completo, precisamos de espaço suficiente para todo o arquivo
-    local vm_size=$(du -g "$vm_file" | cut -f1)
+    # Usando du -h (human-readable) e grep para extrair o tamanho em GB
+    local vm_size=$(du -h "$vm_file" | awk '{print $1}' | grep -o '[0-9.]*' | head -1)
+    # Convertendo para um número inteiro para facilitar comparações
+    vm_size=$(echo "$vm_size" | cut -d. -f1)
+    if [ -z "$vm_size" ]; then vm_size=1; fi
+
     local required_space=$((vm_size + 5))  # VM size + 5GB para segurança
     local available_space=$(df -BG "$backup_dir" | tail -1 | awk '{print $4}' | tr -d 'G')
     
@@ -314,18 +430,34 @@ clean_orphaned_snapshots() {
     local snapshots=$(virsh snapshot-list --domain "$vm_name" --name 2>/dev/null)
     
     if [ -n "$snapshots" ]; then
-        # Procurar por snapshots temporários antigos (mais de 1 dia)
+        # Checar se existem snapshots temporários
         for snap in $snapshots; do
-            # Verificar se é um snapshot temporário ou antigo
-            if [[ "$snap" == temp_export* ]] || [[ "$snap" == *_checkpoint_* ]]; then
-                # Verificar data de criação (não é 100% preciso, mas uma aproximação)
-                local creation_date=$(virsh snapshot-info --domain "$vm_name" --snapshotname "$snap" | grep "Creation time" | cut -d: -f2- | xargs date +%s -d)
-                local current_date=$(date +%s)
-                local age_in_days=$(( (current_date - creation_date) / 86400 ))
+            # Verificar se é um snapshot temporário
+            if [[ "$snap" == temp_export* ]]; then
+                log "Removendo snapshot temporário: $snap"
+                virsh snapshot-delete --domain "$vm_name" --snapshotname "$snap" --metadata 2>/dev/null || true
+            fi
+        done
+        
+        # Remover snapshots antigos baseado na data no nome
+        for snap in $snapshots; do
+            if [[ "$snap" == *_checkpoint_* ]]; then
+                # Extrair a data do nome (formato: VM_checkpoint_YYYYMMDD_HHMMSS)
+                local date_part=$(echo "$snap" | grep -o "[0-9]\{8\}_[0-9]\{6\}" || echo "")
                 
-                if [ "$snap" == "temp_export" ] || [ $age_in_days -gt 1 ]; then
-                    log "Removendo snapshot órfão antigo: $snap"
-                    virsh snapshot-delete --domain "$vm_name" --snapshotname "$snap" || true
+                if [ -n "$date_part" ]; then
+                    # Extrair data (YYYYMMDD)
+                    local snap_date="${date_part:0:8}"
+                    local current_date=$(date +%Y%m%d)
+                    
+                    # Data atual em formato numérico para comparação
+                    local current_num=$(date +%Y%m%d)
+                    # Calcular diferença aproximada em dias
+                    # Se a data do snapshot for de mais de 7 dias atrás, remover
+                    if [ $((current_num - snap_date)) -gt 700 ]; then  # 7 dias * 100 (para simplificar)
+                        log "Removendo snapshot antigo: $snap (mais de 7 dias)"
+                        virsh snapshot-delete --domain "$vm_name" --snapshotname "$snap" --metadata 2>/dev/null || true
+                    fi
                 fi
             fi
         done
@@ -340,16 +472,26 @@ create_checkpoint() {
     
     log "Criando checkpoint '$checkpoint_name' para $vm_name"
     
+    # Verificar se a VM suporta snapshot externo
+    local vm_file_info=$(virsh domblklist "$vm_name" | grep vda | awk '{print $2}')
+    local is_regular_file=true
+    
+    # Verificar se o arquivo do disco é um arquivo regular
+    if [ -n "$vm_file_info" ] && [ ! -f "$vm_file_info" ]; then
+        log "AVISO: O disco da VM não é um arquivo regular. Usando snapshot interno."
+        is_regular_file=false
+    fi
+    
     # Se a VM estiver em execução, usar checkpoint live
     if is_vm_running "$vm_name"; then
-        # Preparar para checkpoint - ações para AD consistente
+        # Preparar para checkpoint - ações para consistência
         log "Preparando VM para checkpoint consistente"
         
-        # Se tiver QEMU guest agent instalado, pode congelar o sistema de arquivos
-        # virsh qemu-agent-command "$vm_name" '{"execute":"guest-fsfreeze-freeze"}' &>/dev/null
+        # Tentar congelar o sistema de arquivos se tiver guest agent
+        virsh qemu-agent-command "$vm_name" '{"execute":"guest-fsfreeze-freeze"}' &>/dev/null || true
         
-        # Criar checkpoint com memória (VM em execução)
-        if [ "$keep_ram" = "true" ]; then
+        # Criar checkpoint
+        if [ "$keep_ram" = "true" ] && [ "$is_regular_file" = "true" ]; then
             # Garantir que diretório para RAM existe
             if [ ! -d "/var/lib/libvirt/qemu/ram" ]; then
                 mkdir -p "/var/lib/libvirt/qemu/ram"
@@ -362,6 +504,7 @@ create_checkpoint() {
                 --live \
                 --memspec file=/var/lib/libvirt/qemu/ram/${vm_name}_${checkpoint_name}.ram
         else
+            # Snapshot interno se não for arquivo regular ou não precisar de RAM
             virsh snapshot-create-as --domain "$vm_name" \
                 --name "$checkpoint_name" \
                 --description "Checkpoint diário para backup incremental" \
@@ -369,8 +512,8 @@ create_checkpoint() {
                 --live
         fi
             
-        # Descongelar o sistema de arquivos se estiver usando guest agent
-        # virsh qemu-agent-command "$vm_name" '{"execute":"guest-fsfreeze-thaw"}' &>/dev/null
+        # Descongelar o sistema de arquivos
+        virsh qemu-agent-command "$vm_name" '{"execute":"guest-fsfreeze-thaw"}' &>/dev/null || true
     else
         # Checkpoint offline
         virsh snapshot-create-as --domain "$vm_name" \
@@ -384,6 +527,94 @@ create_checkpoint() {
         echo "$checkpoint_name"  # Retorna o nome do checkpoint
     else
         log "ERRO: Falha ao criar checkpoint para $vm_name"
+        return 1
+    fi
+}
+
+      
+# Função corrigida para exportar checkpoint
+export_checkpoint() {
+    local vm_name="$1"
+    local disk_name="$2"
+    local backup_file="$3"
+    local checkpoint_name="$4"
+    
+    log "Verificando tipo de disco para exportação..."
+    local disk_path=$(get_disk_path "$vm_name" "$disk_name")
+    
+    # Verificar se obtivemos um caminho válido
+    if [ -z "$disk_path" ]; then
+        log "ERRO: Não foi possível obter o caminho do disco '$disk_name'"
+        return 1
+    fi
+    
+    log "Caminho do disco principal: $disk_path"
+    
+    # Verificar se o caminho do disco existe
+    if [ ! -e "$disk_path" ]; then
+        log "ERRO: O arquivo de disco não existe em: $disk_path"
+        return 1
+    fi
+    
+    # Verificar se o caminho do disco é um arquivo regular
+    if [ -f "$disk_path" ] && [[ "$disk_path" != *"checkpoint"* ]]; then
+        log "Disco é um arquivo regular. Tentando criar snapshot externo..."
+        
+        # Tentar criar snapshot externo
+        virsh snapshot-create-as --domain "$vm_name" \
+            --name "temp_export" \
+            --diskspec "$disk_name,snapshot=external,file=$backup_file" \
+            --atomic \
+            --disk-only
+            
+        if [ $? -eq 0 ]; then
+            log "Snapshot externo criado com sucesso"
+            
+            # Remover o snapshot temporário mantendo o arquivo
+            virsh snapshot-delete --domain "$vm_name" --snapshotname "temp_export" --metadata 2>/dev/null || true
+            return 0
+        else
+            log "ERRO: Falha ao criar snapshot externo. Tentando método alternativo..."
+        fi
+    fi
+    
+    # Método alternativo: exportar o disco diretamente
+    log "Usando exportação direta do disco..."
+    
+    # Verificar se a VM está rodando
+    local vm_running=0
+    if is_vm_running "$vm_name"; then
+        vm_running=1
+        log "VM está em execução. Pausando temporariamente para exportação..."
+        virsh suspend "$vm_name"
+        sleep 2  # Pequena pausa para garantir que a suspensão seja completa
+    fi
+    
+    # Criar diretório de backup se não existir
+    local backup_dir=$(dirname "$backup_file")
+    if [ ! -d "$backup_dir" ]; then
+        mkdir -p "$backup_dir"
+    fi
+    
+    # Copiar o disco - usando o caminho correto do disco
+    log "Copiando de $disk_path para $backup_file..."
+    if cp "$disk_path" "$backup_file"; then
+        log "Exportação direta concluída com sucesso"
+        
+        if [ $vm_running -eq 1 ]; then
+            log "Resumindo VM..."
+            virsh resume "$vm_name"
+        fi
+        
+        return 0
+    else
+        log "ERRO: Falha na exportação direta do disco"
+        
+        if [ $vm_running -eq 1 ]; then
+            log "Resumindo VM após falha..."
+            virsh resume "$vm_name"
+        fi
+        
         return 1
     fi
 }
