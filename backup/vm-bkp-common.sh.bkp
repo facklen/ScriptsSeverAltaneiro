@@ -227,18 +227,7 @@ get_disk_path() {
         block)
             # Disco baseado em dispositivo de bloco (LVM, etc)
             local disk_path=$(grep -A10 "target dev=\"$disk_name\"" /tmp/vm_dumpxml.txt | grep -oP "dev=\"\K[^\"]+")
-            log "DEBUG: Dispositivo de bloco (LVM) detectado: $disk_path"
-            
-            # Para discos LVM, tentar obter caminho real do volume lógico
-            if [[ "$disk_path" == *"/dev/"* ]]; then
-                if [ -e "$disk_path" ]; then
-                    log "DEBUG: Encontrado dispositivo LVM: $disk_path"
-                    # Adicionar flag para identificar que estamos lidando com LVM
-                    echo "LVM:$disk_path"
-                    rm -f /tmp/vm_dumpxml.txt
-                    return 0
-                fi
-            fi
+            log "DEBUG: Dispositivo de bloco detectado: $disk_path"
             ;;
         network)
             # Disco baseado em rede (Ceph RBD, etc)
@@ -723,80 +712,4 @@ cleanup_checkpoints() {
     
     log "==== LIMPEZA DE CHECKPOINTS CONCLUÍDA ===="
     return 0
-}
-
-# Função para backup de VM com LVM
-backup_lvm_disk() {
-    local vm_name="$1"
-    local lvm_path="$2"
-    local backup_file="$3"
-    
-    log "Iniciando backup especializado para disco LVM: $lvm_path"
-    
-    # Criar diretório de backup se não existir
-    local backup_dir=$(dirname "$backup_file")
-    if [ ! -d "$backup_dir" ]; then
-        mkdir -p "$backup_dir"
-    fi
-    
-    # Verificar se a VM está rodando
-    local vm_was_running=0
-    if is_vm_running "$vm_name"; then
-        vm_was_running=1
-        log "VM está em execução. Pausando temporariamente para snapshot LVM..."
-        virsh suspend "$vm_name"
-        sleep 2
-    fi
-    
-    # Obter informações do volume LVM
-    local vg_name=$(lvs --noheadings -o vg_name "$lvm_path" 2>/dev/null | tr -d ' ')
-    local lv_name=$(lvs --noheadings -o lv_name "$lvm_path" 2>/dev/null | tr -d ' ')
-    
-    if [ -z "$vg_name" ] || [ -z "$lv_name" ]; then
-        log "ERRO: Não foi possível obter informações do volume LVM"
-        if [ $vm_was_running -eq 1 ]; then
-            virsh resume "$vm_name"
-        fi
-        return 1
-    fi
-    
-    log "Volume LVM detectado: VG=$vg_name, LV=$lv_name"
-    
-    # Criar snapshot LVM temporário
-    local snap_name="${lv_name}_snap_$(date +%s)"
-    local snap_size="5G"  # Tamanho do snapshot - ajustar conforme necessário
-    
-    log "Criando snapshot LVM: $snap_name com tamanho $snap_size"
-    if ! lvcreate -s -n "$snap_name" -L "$snap_size" "$vg_name/$lv_name"; then
-        log "ERRO: Falha ao criar snapshot LVM"
-        if [ $vm_was_running -eq 1 ]; then
-            virsh resume "$vm_name"
-        fi
-        return 1
-    fi
-    
-    # Resumir VM se estava em execução
-    if [ $vm_was_running -eq 1 ]; then
-        log "Resumindo VM após criar snapshot LVM..."
-        virsh resume "$vm_name"
-    fi
-    
-    local snap_path="/dev/$vg_name/$snap_name"
-    log "Snapshot LVM criado: $snap_path"
-    
-    # Exportar o snapshot para o arquivo de backup
-    log "Exportando snapshot LVM para $backup_file..."
-    if dd if="$snap_path" of="$backup_file" bs=8M status=progress; then
-        log "Exportação do snapshot LVM concluída com sucesso"
-        # Remover o snapshot
-        log "Removendo snapshot LVM temporário..."
-        lvremove -f "$vg_name/$snap_name"
-        return 0
-    else
-        log "ERRO: Falha ao exportar snapshot LVM"
-        # Remover o snapshot em caso de falha
-        log "Removendo snapshot LVM temporário após falha..."
-        lvremove -f "$vg_name/$snap_name"
-        return 1
-    fi
 }

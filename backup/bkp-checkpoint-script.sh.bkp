@@ -111,17 +111,6 @@ if [ $? -eq 0 ]; then
         send_notification "$CONFIG_FILE" "error" "Falha ao obter caminho do disco"
         exit 1
     fi
-
-    # Verificar se estamos lidando com LVM (identificado pela função get_disk_path)
-    if [[ "$DISK_PATH" == LVM:* ]]; then
-        log "Detectado disco LVM: ${DISK_PATH#LVM:}"
-        if backup_lvm_disk "$VM_NAME" "${DISK_PATH#LVM:}" "$BACKUP_FILE"; then
-            BACKUP_SUCCESS=true
-        else
-            BACKUP_SUCCESS=false
-        fi
-        # Pular o restante do processamento normal
-    else
     
     log "Caminho do disco original detectado: $DISK_PATH"
     
@@ -234,7 +223,6 @@ if [ $? -eq 0 ]; then
         log "ERRO: Falha ao exportar checkpoint para backup"
         send_notification "$CONFIG_FILE" "error" "Falha ao exportar checkpoint para backup"
         exit 1
-    fi
     fi
 else
     log "ERRO: Falha ao criar checkpoint para backup"
