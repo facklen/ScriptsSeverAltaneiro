@@ -111,75 +111,76 @@ if [ $? -eq 0 ]; then
         send_notification "$CONFIG_FILE" "error" "Falha ao obter caminho do disco"
         exit 1
     fi
-
-    # Verificar se estamos lidando com LVM (identificado pela função get_disk_path)
-    if [[ "$DISK_PATH" == LVM:* ]]; then
-        log "Detectado disco LVM: ${DISK_PATH#LVM:}"
-        if backup_lvm_disk "$VM_NAME" "${DISK_PATH#LVM:}" "$BACKUP_FILE"; then
+    
+    # Verificar se estamos lidando com VM rodando a partir de um checkpoint
+    if [[ "$DISK_PATH" == CHECKPOINT:* ]]; then
+        log "Detectado que a VM está rodando a partir de um checkpoint: ${DISK_PATH#CHECKPOINT:}"
+        if backup_checkpointed_disk "$VM_NAME" "${DISK_PATH#CHECKPOINT:}" "$BACKUP_FILE"; then
+            log "Backup para VM em checkpoint concluído com sucesso"
             BACKUP_SUCCESS=true
         else
-            BACKUP_SUCCESS=false
-        fi
-        # Pular o restante do processamento normal
-    else
-    
-    log "Caminho do disco original detectado: $DISK_PATH"
-    
-    # Inicializar variável de sucesso do backup
-    BACKUP_SUCCESS=false
-    
-    # Criar snapshot externo ou copiar direto, dependendo do tipo de disco
-    if [ -f "$DISK_PATH" ] && [[ "$DISK_PATH" != *"checkpoint"* ]]; then
-        # Se for um arquivo regular, tentar criar snapshot externo
-        log "Criando snapshot externo com nome de disco: $DISK_NAME"
-        virsh snapshot-create-as --domain "$VM_NAME" \
-            --name "temp_export" \
-            --diskspec "$DISK_NAME,snapshot=external,file=$BACKUP_FILE" \
-            --atomic \
-            --disk-only
-            
-        if [ $? -eq 0 ]; then
-            # Snapshot externo criado com sucesso
-            log "Snapshot externo criado com sucesso"
-            virsh snapshot-delete --domain "$VM_NAME" --snapshotname "temp_export" --metadata
-            BACKUP_SUCCESS=true
-        else
-            log "AVISO: Snapshot externo falhou, tentando método alternativo"
+            log "ERRO: Falha no backup para VM em checkpoint"
             BACKUP_SUCCESS=false
         fi
     else
-        log "Disco não é um arquivo regular ou é um snapshot. Usando método alternativo."
+        log "Caminho do disco original detectado: $DISK_PATH"
+        
+        # Inicializar variável de sucesso do backup
         BACKUP_SUCCESS=false
-    fi
-    
-    # Se o snapshot externo falhou, usar método de cópia direta
-    if [ "$BACKUP_SUCCESS" != "true" ]; then
-        log "Usando exportação direta do disco..."
         
-        # Verificar se a VM está em execução e pausar se necessário
-        VM_WAS_RUNNING=0
-        if is_vm_running "$VM_NAME"; then
-            VM_WAS_RUNNING=1
-            log "VM está em execução. Pausando temporariamente..."
-            virsh suspend "$VM_NAME"
-            sleep 2  # Pequena pausa para garantir que a suspensão seja completa
-        fi
-        
-        # Fazer cópia direta
-        log "Copiando de $DISK_PATH para $BACKUP_FILE..."
-        if cp "$DISK_PATH" "$BACKUP_FILE" 2>/dev/null; then
-            log "Cópia direta concluída com sucesso"
-            BACKUP_SUCCESS=true
+        # Criar snapshot externo ou copiar direto, dependendo do tipo de disco
+        if [ -f "$DISK_PATH" ] && [[ "$DISK_PATH" != *"checkpoint"* ]]; then
+            # Se for um arquivo regular, tentar criar snapshot externo
+            log "Criando snapshot externo com nome de disco: $DISK_NAME"
+            virsh snapshot-create-as --domain "$VM_NAME" \
+                --name "temp_export" \
+                --diskspec "$DISK_NAME,snapshot=external,file=$BACKUP_FILE" \
+                --atomic \
+                --disk-only
+                
+            if [ $? -eq 0 ]; then
+                # Snapshot externo criado com sucesso
+                log "Snapshot externo criado com sucesso"
+                virsh snapshot-delete --domain "$VM_NAME" --snapshotname "temp_export" --metadata
+                BACKUP_SUCCESS=true
+            else
+                log "AVISO: Snapshot externo falhou, tentando método alternativo"
+                BACKUP_SUCCESS=false
+            fi
         else
-            log "ERRO: Falha na cópia direta do disco"
+            log "Disco não é um arquivo regular ou é um snapshot. Usando método alternativo."
             BACKUP_SUCCESS=false
         fi
         
-        # Resumir VM se estava em execução
-        if [ $VM_WAS_RUNNING -eq 1 ]; then
-            log "Resumindo VM..."
-            virsh resume "$VM_NAME"
-            sleep 1
+        # Se o snapshot externo falhou, usar método de cópia direta
+        if [ "$BACKUP_SUCCESS" != "true" ]; then
+            log "Usando exportação direta do disco..."
+            
+            # Verificar se a VM está em execução e pausar se necessário
+            VM_WAS_RUNNING=0
+            if is_vm_running "$VM_NAME"; then
+                VM_WAS_RUNNING=1
+                log "VM está em execução. Pausando temporariamente..."
+                virsh suspend "$VM_NAME"
+                sleep 2  # Pequena pausa para garantir que a suspensão seja completa
+            fi
+            
+            # Fazer cópia direta
+            log "Copiando de $DISK_PATH para $BACKUP_FILE..."
+            if cp "$DISK_PATH" "$BACKUP_FILE" 2>/dev/null; then
+                log "Cópia direta concluída com sucesso"
+                BACKUP_SUCCESS=true
+            else
+                log "ERRO: Falha na cópia direta do disco"
+                BACKUP_SUCCESS=false
+            fi
+            
+            # Resumir VM se estava em execução
+            if [ $VM_WAS_RUNNING -eq 1 ]; then
+                log "Resumindo VM..."
+                virsh resume "$VM_NAME"
+                sleep 1
+            fi
         fi
     fi
     
@@ -234,7 +235,6 @@ if [ $? -eq 0 ]; then
         log "ERRO: Falha ao exportar checkpoint para backup"
         send_notification "$CONFIG_FILE" "error" "Falha ao exportar checkpoint para backup"
         exit 1
-    fi
     fi
 else
     log "ERRO: Falha ao criar checkpoint para backup"
