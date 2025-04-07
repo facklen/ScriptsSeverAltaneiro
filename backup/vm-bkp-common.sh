@@ -207,14 +207,13 @@ get_disk_path() {
     local vm_name="$1"
     local disk_name="$2"
     
-    # Primeiro, obter informações completas sobre o disco
     log "DEBUG: Obtendo informações detalhadas do disco $disk_name para VM $vm_name"
     
-    # Obter o caminho do disco diretamente via domblklist
+    # Método direto: obter caminho do domblklist (mais confiável)
     local current_disk_path=$(virsh domblklist "$vm_name" | grep "$disk_name" | awk '{print $2}')
     
-    # Se for um caminho válido e conter "checkpoint" no nome, marcar como um snapshot/checkpoint
     if [ -n "$current_disk_path" ] && [ "$current_disk_path" != "-" ]; then
+        # Verificar se está rodando a partir de um checkpoint
         if [[ "$current_disk_path" == *"checkpoint"* ]]; then
             log "DEBUG: Detectado que a VM está rodando a partir de um checkpoint: $current_disk_path"
             echo "CHECKPOINT:$current_disk_path"
@@ -223,44 +222,58 @@ get_disk_path() {
             log "DEBUG: Caminho de disco regular encontrado: $current_disk_path"
             echo "$current_disk_path"
             return 0
+        elif [ -e "$current_disk_path" ]; then
+            # Dispositivo especial (ex: LVM)
+            log "DEBUG: Dispositivo especial detectado: $current_disk_path"
+            echo "LVM:$current_disk_path"
+            return 0
         fi
     fi
     
-    # Se falhar, tentar outros métodos
-    # Armazenar XML da VM em arquivo temporário para análise
-    virsh dumpxml "$vm_name" > /tmp/vm_dumpxml.txt 2>/dev/null
+    # Se o método direto falhar, tentar através do XML
+    log "DEBUG: Método direto falhou, tentando via XML"
     
-    # Tentar extrair o caminho do arquivo de uma forma diferente
-    local source_file=$(grep -A10 "<target dev=\"$disk_name\"" /tmp/vm_dumpxml.txt | grep -oP 'file="\K[^"]+')
+    # Armazenar XML temporariamente
+    local xml_file=$(mktemp)
+    virsh dumpxml "$vm_name" > "$xml_file" 2>/dev/null
     
-    if [ -n "$source_file" ]; then
+    # Extrair informações do disco do XML
+    local source_file=$(grep -A15 "<target dev=\"$disk_name\"" "$xml_file" | grep -oP 'file="\K[^"]+')
+    local source_dev=$(grep -A15 "<target dev=\"$disk_name\"" "$xml_file" | grep -oP 'dev="\K[^"]+')
+    
+    # Limpar arquivo temporário
+    rm -f "$xml_file"
+    
+    # Verificar resultados da extração do XML
+    if [ -n "$source_file" ] && [ -f "$source_file" ]; then
         if [[ "$source_file" == *"checkpoint"* ]]; then
             log "DEBUG: Detectado via XML que a VM está rodando a partir de um checkpoint: $source_file"
             echo "CHECKPOINT:$source_file"
-            rm -f /tmp/vm_dumpxml.txt
             return 0
-        elif [ -f "$source_file" ]; then
-            log "DEBUG: Caminho de arquivo via XML encontrado: $source_file"
+        else
+            log "DEBUG: Caminho de arquivo via XML: $source_file"
             echo "$source_file"
-            rm -f /tmp/vm_dumpxml.txt
             return 0
         fi
+    elif [ -n "$source_dev" ] && [ -e "$source_dev" ]; then
+        log "DEBUG: Dispositivo especial via XML: $source_dev"
+        echo "LVM:$source_dev"
+        return 0
     fi
     
-    # Último recurso: caminho padrão baseado no nome da VM
+    # Último recurso: caminho padrão
     log "DEBUG: Tentando caminhos padrão baseados no nome da VM"
+    
     for path in "/var/lib/libvirt/images/${vm_name}.qcow2" "/var/lib/libvirt/images/${vm_name}.img"; do
         if [ -f "$path" ]; then
             log "DEBUG: Arquivo encontrado em caminho padrão: $path"
             echo "$path"
-            rm -f /tmp/vm_dumpxml.txt 2>/dev/null
             return 0
         fi
     done
     
     # Se chegamos aqui, não foi possível encontrar o caminho
     log "ERRO: Não foi possível determinar o caminho do disco para VM $vm_name"
-    rm -f /tmp/vm_dumpxml.txt 2>/dev/null
     return 1
 }
 
@@ -742,7 +755,7 @@ backup_lvm_disk() {
     fi
 }
 
-# Função para backup de VM rodando a partir de um checkpoint
+# Função melhorada para backup de VM rodando a partir de um checkpoint
 backup_checkpointed_disk() {
     local vm_name="$1"
     local checkpoint_path="$2"
@@ -754,30 +767,30 @@ backup_checkpointed_disk() {
     local backup_dir=$(dirname "$backup_file")
     if [ ! -d "$backup_dir" ]; then
         mkdir -p "$backup_dir"
+        log "Criado diretório de backup: $backup_dir"
     fi
     
     # Tentar obter o arquivo base original da VM
-    local original_file=""
-    local base_info=$(qemu-img info --backing-chain "$checkpoint_path" 2>/dev/null | grep "backing file:" | head -1)
+    log "Tentando identificar arquivo base original..."
+    local original_file="/var/lib/libvirt/images/${vm_name}.qcow2"
+    local base_info=""
     
-    if [ -n "$base_info" ]; then
-        original_file=$(echo "$base_info" | sed -E 's/backing file: (.*)/\1/' | sed -E 's/ \(.*\)//')
-        log "Arquivo base identificado: $original_file"
-    else
-        # Tentar outro método para identificar o original
-        original_file="/var/lib/libvirt/images/${vm_name}.qcow2"
-        if [ -f "$original_file" ]; then
-            log "Usando arquivo original por convenção de nomenclatura: $original_file"
-        else
-            log "AVISO: Não foi possível determinar o arquivo original, tentando backup direto"
-            original_file=""
+    # Tentar obter informações de backing chain usando qemu-img
+    if command -v qemu-img >/dev/null 2>&1; then
+        base_info=$(qemu-img info --backing-chain "$checkpoint_path" 2>/dev/null | grep "backing file:" | head -1)
+        if [ -n "$base_info" ]; then
+            # Extrair caminho do arquivo base a partir da saída do qemu-img
+            local extracted_path=$(echo "$base_info" | sed -E 's/backing file: (.*)/\1/' | sed -E 's/ \(.*\)//')
+            if [ -f "$extracted_path" ]; then
+                original_file="$extracted_path"
+                log "Arquivo base identificado via qemu-img: $original_file"
+            fi
         fi
     fi
     
-    # Decidir a estratégia a ser usada
-    if [ -n "$original_file" ] && [ -f "$original_file" ]; then
-        # Se temos o arquivo original, podemos tentar criar um novo checkpoint a partir dele
-        log "Estratégia: Criar novo checkpoint a partir do arquivo base"
+    # Verificar se o arquivo base existe
+    if [ -f "$original_file" ]; then
+        log "Usando arquivo base: $original_file"
         
         # Verificar se a VM está rodando
         local vm_was_running=0
@@ -790,7 +803,7 @@ backup_checkpointed_disk() {
         
         # Copiar o arquivo original para o novo backup
         log "Copiando arquivo original para backup: $original_file -> $backup_file"
-        if cp "$original_file" "$backup_file"; then
+        if cp "$original_file" "$backup_file" 2>/dev/null; then
             log "Cópia do arquivo original concluída com sucesso"
             
             if [ $vm_was_running -eq 1 ]; then
@@ -807,12 +820,16 @@ backup_checkpointed_disk() {
                 virsh resume "$vm_name"
             fi
             
-            return 1
+            # Se falhar, tentar o método alternativo
+            log "Tentando método alternativo com qemu-img..."
         fi
     else
-        # Se não temos o arquivo original, tentar método alternativo com qemu-img
-        log "Estratégia: Usar qemu-img para criar um novo snapshot sem dependências"
-        
+        log "Arquivo base não encontrado em: $original_file"
+        log "Usando método alternativo com qemu-img..."
+    fi
+    
+    # Método alternativo: usar qemu-img para criar um snapshot e desvinculá-lo
+    if command -v qemu-img >/dev/null 2>&1; then
         # Verificar se a VM está rodando
         local vm_was_running=0
         if is_vm_running "$vm_name"; then
@@ -822,27 +839,59 @@ backup_checkpointed_disk() {
             sleep 2
         fi
         
-        # Criar novo snapshot consolidado usando qemu-img
-        log "Criando snapshot consolidado usando qemu-img..."
-        if qemu-img create -f qcow2 -b "$checkpoint_path" "$backup_file"; then
-            log "Snapshot consolidado criado: $backup_file"
+        # Criar novo snapshot baseado no checkpoint atual
+        log "Criando snapshot baseado no checkpoint usando qemu-img..."
+        if qemu-img create -f qcow2 -b "$checkpoint_path" "$backup_file" 2>/dev/null; then
+            log "Snapshot criado com sucesso: $backup_file"
             
             if [ $vm_was_running -eq 1 ]; then
                 log "Resumindo VM..."
                 virsh resume "$vm_name"
             fi
             
-            # Realizar rebase para remover dependências
+            # Tornar o snapshot independente
             log "Realizando rebase para remover dependências..."
-            if qemu-img rebase -f qcow2 -b "" "$backup_file"; then
+            if qemu-img rebase -f qcow2 -b "" "$backup_file" 2>/dev/null; then
                 log "Rebase concluído com sucesso, arquivo independente criado"
                 return 0
             else
-                log "ERRO: Falha no rebase. O backup pode ter dependências"
-                return 1
+                log "AVISO: Falha no rebase, tentando método direto..."
+                
+                # Se rebase falhar, tentar novamente com método de cópia direta
+                if [ -f "$backup_file" ]; then
+                    rm -f "$backup_file"  # Remover arquivo parcial
+                fi
+                
+                # Método final: exportação direta (menos eficiente, mas mais compatível)
+                if [ $vm_was_running -eq 1 ]; then
+                    log "Pausando VM novamente para método direto..."
+                    virsh suspend "$vm_name"
+                    sleep 2
+                fi
+                
+                log "Copiando diretamente o checkpoint para o backup..."
+                if cp "$checkpoint_path" "$backup_file" 2>/dev/null; then
+                    log "Cópia direta concluída com sucesso"
+                    
+                    if [ $vm_was_running -eq 1 ]; then
+                        log "Resumindo VM..."
+                        virsh resume "$vm_name"
+                    fi
+                    
+                    return 0
+                else
+                    log "ERRO: Todos os métodos de backup falharam"
+                    
+                    if [ $vm_was_running -eq 1 ]; then
+                        log "Resumindo VM após falha..."
+                        virsh resume "$vm_name"
+                    fi
+                    
+                    return 1
+                fi
             fi
         else
-            log "ERRO: Falha ao criar snapshot consolidado"
+            log "ERRO: Falha ao criar snapshot usando qemu-img"
             
             if [ $vm_was_running -eq 1 ]; then
                 log "Resumindo VM após falha..."
@@ -851,5 +900,8 @@ backup_checkpointed_disk() {
             
             return 1
         fi
+    else
+        log "ERRO: Comando qemu-img não encontrado. Instale com: sudo apt install qemu-utils"
+        return 1
     fi
 }

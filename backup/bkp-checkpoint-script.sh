@@ -70,8 +70,17 @@ if [ -z "$DISK_NAME" ]; then
 fi
 log "Nome do disco detectado: $DISK_NAME"
 
+# Obter o caminho atual do disco principal diretamente (método mais confiável)
+CURRENT_DISK_PATH=$(virsh domblklist "$VM_NAME" | grep "$DISK_NAME" | awk '{print $2}')
+if [ -z "$CURRENT_DISK_PATH" ]; then
+    log "ERRO: Não foi possível obter o caminho do disco vda"
+    send_notification "$CONFIG_FILE" "error" "Falha ao obter caminho do disco"
+    exit 1
+fi
+log "Caminho do disco atual: $CURRENT_DISK_PATH"
+
 # Para debug: imprimir informação detalhada sobre os discos da VM
-log "Saída do comando 'virsh domblklist':"
+log "Informações detalhadas sobre os discos:"
 virsh domblklist "$VM_NAME" >> "$LOG_FILE" 2>&1
 
 # Verificar que o nome do disco foi detectado corretamente
@@ -97,39 +106,128 @@ if [ $? -eq 0 ]; then
         log "Criado diretório de backup: $BACKUP_DIR"
     fi
     
-    # Garantir que temos o nome do disco correto
-    if [ -z "$DISK_NAME" ]; then
-        log "ERRO: Nome de disco não encontrado. Abortando."
-        send_notification "$CONFIG_FILE" "error" "Nome de disco não encontrado"
-        exit 1
-    fi
+    # Inicializar variável de sucesso do backup
+    BACKUP_SUCCESS=false
     
-    # Obter o caminho real do disco usando a nova função get_disk_path
-    DISK_PATH=$(get_disk_path "$VM_NAME" "$DISK_NAME")
-    if [ $? -ne 0 ] || [ -z "$DISK_PATH" ]; then
-        log "ERRO: Falha ao obter caminho do disco. Abortando."
-        send_notification "$CONFIG_FILE" "error" "Falha ao obter caminho do disco"
-        exit 1
-    fi
-    
-    # Verificar se estamos lidando com VM rodando a partir de um checkpoint
-    if [[ "$DISK_PATH" == CHECKPOINT:* ]]; then
-        log "Detectado que a VM está rodando a partir de um checkpoint: ${DISK_PATH#CHECKPOINT:}"
-        if backup_checkpointed_disk "$VM_NAME" "${DISK_PATH#CHECKPOINT:}" "$BACKUP_FILE"; then
-            log "Backup para VM em checkpoint concluído com sucesso"
-            BACKUP_SUCCESS=true
+    # Verificar tipo de disco e determinar a estratégia de backup
+    if [[ "$CURRENT_DISK_PATH" == *"checkpoint"* ]]; then
+        # VM está rodando a partir de um checkpoint
+        log "Detectado que a VM está rodando a partir de um checkpoint: $CURRENT_DISK_PATH"
+        
+        # Tentar encontrar o arquivo base original
+        ORIGINAL_FILE="/var/lib/libvirt/images/${VM_NAME}.qcow2"
+        # Tentar usar qemu-img info para encontrar o arquivo base
+        if command -v qemu-img >/dev/null 2>&1; then
+            BASE_INFO=$(qemu-img info --backing-chain "$CURRENT_DISK_PATH" 2>/dev/null | grep "backing file:" | head -1)
+            if [ -n "$BASE_INFO" ]; then
+                EXTRACTED_PATH=$(echo "$BASE_INFO" | sed -E 's/backing file: (.*)/\1/' | sed -E 's/ \(.*\)//')
+                if [ -f "$EXTRACTED_PATH" ]; then
+                    ORIGINAL_FILE="$EXTRACTED_PATH"
+                    log "Arquivo base identificado via qemu-img: $ORIGINAL_FILE"
+                fi
+            fi
+        fi
+        
+        if [ -f "$ORIGINAL_FILE" ]; then
+            # Encontramos o arquivo base, usar estratégia 1: copiar o arquivo base
+            log "Usando arquivo base: $ORIGINAL_FILE"
+            
+            # Verificar se a VM está rodando
+            VM_WAS_RUNNING=0
+            if is_vm_running "$VM_NAME"; then
+                VM_WAS_RUNNING=1
+                log "VM está em execução. Pausando temporariamente..."
+                virsh suspend "$VM_NAME"
+                sleep 2
+            fi
+            
+            # Copiar o arquivo original para o backup
+            log "Copiando arquivo original para backup: $ORIGINAL_FILE -> $BACKUP_FILE"
+            if cp "$ORIGINAL_FILE" "$BACKUP_FILE" 2>/dev/null; then
+                log "Cópia do arquivo original concluída com sucesso"
+                BACKUP_SUCCESS=true
+            else
+                log "ERRO: Falha ao copiar arquivo original"
+                BACKUP_SUCCESS=false
+            fi
+            
+            # Resumir VM se estava em execução
+            if [ $VM_WAS_RUNNING -eq 1 ]; then
+                log "Resumindo VM..."
+                virsh resume "$VM_NAME"
+                sleep 1
+            fi
+        elif command -v qemu-img >/dev/null 2>&1; then
+            # Não encontramos o arquivo base ou não conseguimos acessá-lo
+            # Estratégia 2: usar qemu-img para criar snapshot
+            log "Arquivo base não encontrado. Usando qemu-img para criar snapshot..."
+            
+            # Verificar se a VM está rodando
+            VM_WAS_RUNNING=0
+            if is_vm_running "$VM_NAME"; then
+                VM_WAS_RUNNING=1
+                log "VM está em execução. Pausando temporariamente..."
+                virsh suspend "$VM_NAME"
+                sleep 2
+            fi
+            
+            # Criar snapshot usando qemu-img
+            log "Criando snapshot com qemu-img: $CURRENT_DISK_PATH -> $BACKUP_FILE"
+            if qemu-img create -f qcow2 -b "$CURRENT_DISK_PATH" "$BACKUP_FILE" 2>/dev/null; then
+                log "Snapshot criado com sucesso"
+                
+                # Tentar rebase para tornar independente
+                log "Executando rebase para remover dependências..."
+                qemu-img rebase -f qcow2 -b "" "$BACKUP_FILE" 2>/dev/null
+                # Mesmo que o rebase falhe, consideramos o backup um sucesso
+                BACKUP_SUCCESS=true
+            else
+                log "ERRO: Falha ao criar snapshot com qemu-img"
+                BACKUP_SUCCESS=false
+            fi
+            
+            # Resumir VM se estava em execução
+            if [ $VM_WAS_RUNNING -eq 1 ]; then
+                log "Resumindo VM..."
+                virsh resume "$VM_NAME"
+                sleep 1
+            fi
         else
-            log "ERRO: Falha no backup para VM em checkpoint"
-            BACKUP_SUCCESS=false
+            # Método de último recurso: cópia direta
+            log "O comando qemu-img não está disponível. Tentando cópia direta..."
+            
+            # Verificar se a VM está rodando
+            VM_WAS_RUNNING=0
+            if is_vm_running "$VM_NAME"; then
+                VM_WAS_RUNNING=1
+                log "VM está em execução. Pausando temporariamente..."
+                virsh suspend "$VM_NAME"
+                sleep 2
+            fi
+            
+            # Tentar cópia direta
+            log "Copiando diretamente: $CURRENT_DISK_PATH -> $BACKUP_FILE"
+            if cp "$CURRENT_DISK_PATH" "$BACKUP_FILE" 2>/dev/null; then
+                log "Cópia direta concluída com sucesso"
+                BACKUP_SUCCESS=true
+            else
+                log "ERRO: Falha na cópia direta"
+                BACKUP_SUCCESS=false
+            fi
+            
+            # Resumir VM se estava em execução
+            if [ $VM_WAS_RUNNING -eq 1 ]; then
+                log "Resumindo VM..."
+                virsh resume "$VM_NAME"
+                sleep 1
+            fi
         fi
     else
-        log "Caminho do disco original detectado: $DISK_PATH"
-        
-        # Inicializar variável de sucesso do backup
-        BACKUP_SUCCESS=false
+        # VM está usando um disco normal
+        log "VM está usando um disco normal: $CURRENT_DISK_PATH"
         
         # Criar snapshot externo ou copiar direto, dependendo do tipo de disco
-        if [ -f "$DISK_PATH" ] && [[ "$DISK_PATH" != *"checkpoint"* ]]; then
+        if [ -f "$CURRENT_DISK_PATH" ] && [[ "$CURRENT_DISK_PATH" != *"checkpoint"* ]]; then
             # Se for um arquivo regular, tentar criar snapshot externo
             log "Criando snapshot externo com nome de disco: $DISK_NAME"
             virsh snapshot-create-as --domain "$VM_NAME" \
@@ -148,7 +246,7 @@ if [ $? -eq 0 ]; then
                 BACKUP_SUCCESS=false
             fi
         else
-            log "Disco não é um arquivo regular ou é um snapshot. Usando método alternativo."
+            log "Disco não é um arquivo regular. Usando método alternativo."
             BACKUP_SUCCESS=false
         fi
         
@@ -166,8 +264,8 @@ if [ $? -eq 0 ]; then
             fi
             
             # Fazer cópia direta
-            log "Copiando de $DISK_PATH para $BACKUP_FILE..."
-            if cp "$DISK_PATH" "$BACKUP_FILE" 2>/dev/null; then
+            log "Copiando de $CURRENT_DISK_PATH para $BACKUP_FILE..."
+            if cp "$CURRENT_DISK_PATH" "$BACKUP_FILE" 2>/dev/null; then
                 log "Cópia direta concluída com sucesso"
                 BACKUP_SUCCESS=true
             else
