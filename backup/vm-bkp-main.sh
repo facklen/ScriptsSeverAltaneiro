@@ -70,7 +70,7 @@ backup_vm() {
             fi
             
             if [ -f "${SCRIPT_DIR}/bkp-offline-script.sh" ]; then
-                ${SCRIPT_DIR}/bkp-offline-script.sh.sh "$config_file" "$vm_name"
+                ${SCRIPT_DIR}/bkp-offline-script.sh "$config_file" "$vm_name"
             else
                 echo "ERRO: Script de backup offline não encontrado"
                 return 1
