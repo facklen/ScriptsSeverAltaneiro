@@ -1,8 +1,5 @@
-# Script de backup do winserver com checkpoint
-0 23 * * 1-5 /home/goku/backup/backup-winserver-checkpoint.sh
-# Script de backup do winserver offline com cleanup de checkpoints
-0 23 * * 6 /home/goku/backup/backup-winserver-offline-with-cleanup.sh
+PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
 # Script de backup checkpoint
-30 23 * * 1-5 /home/goku/scripts/backup/vm-bkp-main.sh /home/goku/scripts/backup/config.yaml checkpoint > /dev/null 2>&1
+00 22 * * 1-5 /home/goku/scripts/backup/vm-bkp-main.sh /home/goku/scripts/backup/config.yaml checkpoint > /dev/null 2>&1
 # Script de backup do winserver offline com cleanup de checkpoints
 0 3 * * 6 /home/goku/scripts/backup/vm-bkp-main.sh /home/goku/scripts/backup/config.yaml offline > /dev/null 2>&1
