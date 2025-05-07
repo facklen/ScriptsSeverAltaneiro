@@ -7,11 +7,12 @@ global:
     # Método de notificação: email, slack, teams, none
     method: email
     email:
-      recipient: ti_altaneiro@altaneiro.com.br
+      recipient: admin@example.com
     # Adicione configurações para outros métodos se necessário
 
 # Configurações de retenção padrão
 default_retention:
+  checkpoint: 5  # dias para manter checkpoints
   weekly: 5      # número de backups semanais a manter
 
 # Lista de VMs para backup
@@ -22,11 +23,19 @@ vms:
     description: "Windows Server 2022 com Active Directory"
     vm_file: /var/lib/libvirt/images/win2022.qcow2
     backup_types:
+      - type: checkpoint
+        enabled: true
+        schedule: "daily"  # pode ser usado com crontab
+        retention_days: 5 # sobrescreve o padrão, se necessário
+        special_options:
+          keep_ram: true   # opções específicas para este tipo de backup
       - type: offline
         enabled: true
-        schedule: "weekly" # referência para uso com crontab
+        schedule: "weekly" # pode ser usado com crontab
         retention_count: 5 # sobrescreve o padrão, se necessário
-        shutdown_timeout: 600 # tempo em segundos para aguardar desligamento
+        shutdown_timeout: 600
+        special_options:
+          keep_last_checkpoint: false
 
   # Snipe-IT
   - name: VMSnipeit
@@ -34,8 +43,16 @@ vms:
     description: "Snipe-IT on Ubuntu Server LTS" 
     vm_file: /var/lib/libvirt/images/VMSnipeit.qcow2
     backup_types:
+      - type: checkpoint
+        enabled: true
+        schedule: "daily"
+        retention_days: 5 # sobrescreve o padrão, se necessário
+        special_options:
+          keep_ram: true   # opções específicas para este tipo de backup
       - type: offline
         enabled: true
-        schedule: "weekly"
-        retention_count: 5
+        schedule: "weekly" # pode ser usado com crontab
+        retention_count: 5 # sobrescreve o padrão, se necessário
         shutdown_timeout: 600
+        special_options:
+          keep_last_checkpoint: false
