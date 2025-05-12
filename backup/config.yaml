@@ -25,7 +25,7 @@ vms:
       - type: offline
         enabled: true
         schedule: "weekly" # referência para uso com crontab
-        retention_count: 5 # sobrescreve o padrão, se necessário
+        retention_count: 4 # sobrescreve o padrão, se necessário
         shutdown_timeout: 600 # tempo em segundos para aguardar desligamento
 
   # Snipe-IT
@@ -37,5 +37,29 @@ vms:
       - type: offline
         enabled: true
         schedule: "weekly"
-        retention_count: 5
+        retention_count: 4
+        shutdown_timeout: 600
+
+  # Unifi
+  - name: vmunifi
+    enabled: true
+    description: "Unifi on Ubuntu Server LTS"
+    vm_file: /var/lib/libvirt/images/vmunifi.qcow2
+    backup_types:
+      - type: offline
+        enabled: true
+        schedule: "weekly"
+        retention_count: 4
+        shutdown_timeout: 600
+
+  # Dimep - Windows 10
+  - name: win10Dimep
+    enabled: true
+    description: "Windows 10 com serviço Dimep"
+    vm_file: /var/lib/libvirt/images/win10-dimep.qcom2
+    backup_types:
+      - type: offline
+        enabled: true
+        schedule: "weekly"
+        retention_count: 4
         shutdown_timeout: 600

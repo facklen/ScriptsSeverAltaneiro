@@ -1,5 +1,3 @@
 PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin:/snap/bin
-# Script de backup checkpoint
-00 22 * * 1-5 /home/goku/scripts/backup/vm-bkp-main.sh /home/goku/scripts/backup/config.yaml checkpoint > /dev/null 2>&1
-# Script de backup do winserver offline com cleanup de checkpoints
-0 3 * * 6 /home/goku/scripts/backup/vm-bkp-main.sh /home/goku/scripts/backup/config.yaml offline > /dev/null 2>&1
+# Script de backup semanal - executado todo domingo às 2h
+0 2 * * 0 /home/goku/scripts/backup/vm_backup.sh /home/goku/scripts/backup/vm_backup_config.yaml > /dev/null 2>&1
